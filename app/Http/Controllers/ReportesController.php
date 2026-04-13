@@ -16,9 +16,11 @@ use App\Models\Ups;
 use App\Models\UpsBitacora;
 use App\Models\User;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
 use Inertia\Inertia;
 use Inertia\Response;
 use Symfony\Component\HttpFoundation\StreamedResponse;
+use Throwable;
 
 class ReportesController extends Controller
 {
@@ -303,6 +305,11 @@ class ReportesController extends Controller
             abort(403, 'No tienes permiso para ver reportes.');
         }
 
+        $request->validate([
+            'fecha_desde' => ['nullable', 'date'],
+            'fecha_hasta' => ['nullable', 'date'],
+        ]);
+
         $perPage = (int) ($request->query('per_page', 20));
         $perPage = max(1, min(100, $perPage));
 
@@ -365,7 +372,7 @@ class ReportesController extends Controller
         $accesos = $query->orderByDesc('fecha_acceso')->paginate($perPage)->withQueryString()
             ->through(fn(Acceso $a) => [
                 'id' => $a->id,
-                'fecha_acceso' => $a->fecha_acceso?->format('d/m/Y H:i:s'),
+                'fecha_acceso' => self::formatFechaAccesoParaReporte($a),
                 'user' => $a->user ? [
                     'id' => $a->user->id,
                     'name' => $a->user->name,
@@ -503,7 +510,7 @@ class ReportesController extends Controller
             foreach ($accesos as $acceso) {
                 fputcsv($file, [
                     $acceso->id,
-                    $acceso->fecha_acceso?->format('Y-m-d H:i:s') ?? '',
+                    self::formatFechaAccesoParaCsv($acceso),
                     $acceso->user?->name ?? 'N/A',
                     $acceso->user?->email ?? 'N/A',
                     $acceso->puerta?->piso?->nombre ?? 'N/A',
@@ -719,6 +726,48 @@ class ReportesController extends Controller
     /**
      * @param  array<string, mixed>  $datosExtraidos
      */
+    /**
+     * Formatea fecha_acceso para la tabla del reporte (evita 500 si hay fechas corruptas o inválidas en BD).
+     */
+    private static function formatFechaAccesoParaReporte(Acceso $acceso): ?string
+    {
+        try {
+            return $acceso->fecha_acceso?->format('d/m/Y H:i:s');
+        } catch (Throwable $e) {
+            Log::warning('Reporte accesos: fecha_acceso no parseable', [
+                'acceso_id' => $acceso->id,
+                'raw' => $acceso->getRawOriginal('fecha_acceso'),
+                'message' => $e->getMessage(),
+            ]);
+
+            $raw = $acceso->getRawOriginal('fecha_acceso');
+            if (is_string($raw) && $raw !== '' && $raw !== '0000-00-00 00:00:00') {
+                return $raw;
+            }
+
+            return null;
+        }
+    }
+
+    /**
+     * Formatea fecha_acceso para CSV (misma tolerancia que la vista web).
+     */
+    private static function formatFechaAccesoParaCsv(Acceso $acceso): string
+    {
+        try {
+            return $acceso->fecha_acceso?->format('Y-m-d H:i:s') ?? '';
+        } catch (Throwable $e) {
+            Log::warning('Export accesos CSV: fecha_acceso no parseable', [
+                'acceso_id' => $acceso->id,
+                'raw' => $acceso->getRawOriginal('fecha_acceso'),
+                'message' => $e->getMessage(),
+            ]);
+            $raw = $acceso->getRawOriginal('fecha_acceso');
+
+            return is_string($raw) && $raw !== '' && $raw !== '0000-00-00 00:00:00' ? $raw : '';
+        }
+    }
+
     private static function upsDatosAdicionalesPlano(array $datosExtraidos): string
     {
         $d = $datosExtraidos['datos_adicionales'] ?? null;
