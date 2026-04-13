@@ -30,4 +30,5 @@ MEJORAS_FUTURAS.md
 /nginx/ssl/*
 /nginx/logs/*
 !.gitkeep
-*.py
+
+/python
