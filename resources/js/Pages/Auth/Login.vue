@@ -182,12 +182,15 @@
                 </p>
             </div>
         </div>
+
+        <OfflineQrOverlay />
     </div>
 </template>
 
 <script setup>
 import { ref } from "vue";
 import { useForm, Link } from "@inertiajs/vue3";
+import OfflineQrOverlay from "@/Components/OfflineQrOverlay.vue";
 
 defineOptions({
     layout: null, // Sin layout para login
