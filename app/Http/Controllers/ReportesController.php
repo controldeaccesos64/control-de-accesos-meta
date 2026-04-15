@@ -15,6 +15,7 @@ use App\Models\TipoPuerta;
 use App\Models\Ups;
 use App\Models\UpsBitacora;
 use App\Models\User;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use Inertia\Inertia;
@@ -326,48 +327,7 @@ class ReportesController extends Controller
         $query = Acceso::query()
             ->with(['user.role', 'user.gerencia.secretaria', 'puerta.piso']);
 
-        if (!empty($filtros['fecha_desde'])) {
-            $query->whereDate('fecha_acceso', '>=', $filtros['fecha_desde']);
-        }
-
-        if (!empty($filtros['fecha_hasta'])) {
-            $query->whereDate('fecha_acceso', '<=', $filtros['fecha_hasta']);
-        }
-
-        // Filtrar por gerencia o despacho (si se especifica)
-        if (!empty($filtros['gerencia_id'])) {
-            if ($filtros['gerencia_id'] === 'despacho') {
-                // Filtrar usuarios con gerencia_id null (Despacho)
-                $query->whereHas('user', function ($q) {
-                    $q->whereNull('gerencia_id');
-                });
-            } else {
-                // Filtrar por gerencia específica
-                $query->whereHas('user', function ($q) use ($filtros) {
-                    $q->where('gerencia_id', $filtros['gerencia_id']);
-                });
-            }
-        }
-        // Filtrar por secretaría (si se especifica pero no gerencia específica ni despacho)
-        elseif (!empty($filtros['secretaria_id'])) {
-            $query->whereHas('user.gerencia', function ($q) use ($filtros) {
-                $q->where('secretaria_id', $filtros['secretaria_id']);
-            });
-        }
-
-        if (!empty($filtros['piso_id'])) {
-            $query->whereHas('puerta', function ($q) use ($filtros) {
-                $q->where('piso_id', $filtros['piso_id']);
-            });
-        }
-
-        if (!empty($filtros['tipo_evento'])) {
-            $query->where('tipo_evento', $filtros['tipo_evento']);
-        }
-
-        if (isset($filtros['permitido']) && $filtros['permitido'] !== '') {
-            $query->where('permitido', (bool) $filtros['permitido']);
-        }
+        self::applyAccesosReportFilters($query, $filtros);
 
         $accesos = $query->orderByDesc('fecha_acceso')->paginate($perPage)->withQueryString()
             ->through(fn(Acceso $a) => [
@@ -426,6 +386,11 @@ class ReportesController extends Controller
             abort(403, 'No tienes permiso para exportar reportes.');
         }
 
+        $request->validate([
+            'fecha_desde' => ['nullable', 'date'],
+            'fecha_hasta' => ['nullable', 'date'],
+        ]);
+
         $filtros = $request->only([
             'fecha_desde',
             'fecha_hasta',
@@ -436,64 +401,22 @@ class ReportesController extends Controller
             'permitido',
         ]);
 
-        $query = Acceso::query()
-            ->with(['user.gerencia.secretaria', 'puerta.piso']);
-
-        if (!empty($filtros['fecha_desde'])) {
-            $query->whereDate('fecha_acceso', '>=', $filtros['fecha_desde']);
-        }
-
-        if (!empty($filtros['fecha_hasta'])) {
-            $query->whereDate('fecha_acceso', '<=', $filtros['fecha_hasta']);
-        }
-
-        // Filtrar por gerencia o despacho (si se especifica)
-        if (!empty($filtros['gerencia_id'])) {
-            if ($filtros['gerencia_id'] === 'despacho') {
-                // Filtrar usuarios con gerencia_id null (Despacho)
-                $query->whereHas('user', function ($q) {
-                    $q->whereNull('gerencia_id');
-                });
-            } else {
-                // Filtrar por gerencia específica
-                $query->whereHas('user', function ($q) use ($filtros) {
-                    $q->where('gerencia_id', $filtros['gerencia_id']);
-                });
-            }
-        }
-        // Filtrar por secretaría (si se especifica pero no gerencia específica ni despacho)
-        elseif (!empty($filtros['secretaria_id'])) {
-            $query->whereHas('user.gerencia', function ($q) use ($filtros) {
-                $q->where('secretaria_id', $filtros['secretaria_id']);
-            });
-        }
-
-        if (!empty($filtros['piso_id'])) {
-            $query->whereHas('puerta', function ($q) use ($filtros) {
-                $q->where('piso_id', $filtros['piso_id']);
-            });
-        }
-
-        if (!empty($filtros['tipo_evento'])) {
-            $query->where('tipo_evento', $filtros['tipo_evento']);
-        }
-
-        if (isset($filtros['permitido']) && $filtros['permitido'] !== '') {
-            $query->where('permitido', (bool) $filtros['permitido']);
-        }
-
-        $accesos = $query->orderByDesc('fecha_acceso')->get();
-
         $filename = 'reporte_accesos_' . date('Y-m-d_His') . '.csv';
 
-        return response()->streamDownload(function () use ($accesos) {
-            $file = fopen('php://output', 'w');
+        return response()->streamDownload(static function () use ($filtros) {
+            $handle = fopen('php://output', 'w');
+            if ($handle === false) {
+                return;
+            }
 
-            // BOM para UTF-8
-            fprintf($file, chr(0xEF) . chr(0xBB) . chr(0xBF));
+            $query = Acceso::query()
+                ->with(['user.gerencia.secretaria', 'puerta.piso']);
 
-            // Encabezados
-            fputcsv($file, [
+            self::applyAccesosReportFilters($query, $filtros);
+
+            fprintf($handle, chr(0xEF) . chr(0xBB) . chr(0xBF));
+
+            fputcsv($handle, [
                 'ID',
                 'Fecha y Hora',
                 'Usuario',
@@ -506,27 +429,113 @@ class ReportesController extends Controller
                 'Observaciones',
             ]);
 
-            // Datos
-            foreach ($accesos as $acceso) {
-                fputcsv($file, [
+            // Sin ->get() masivo: paginar por lotes manteniendo el mismo criterio de orden que el visor.
+            $query->orderByDesc('fecha_acceso')->orderByDesc('id');
+
+            foreach ($query->lazy(750) as $acceso) {
+                fputcsv($handle, [
                     $acceso->id,
                     self::formatFechaAccesoParaCsv($acceso),
-                    $acceso->user?->name ?? 'N/A',
-                    $acceso->user?->email ?? 'N/A',
-                    $acceso->puerta?->piso?->nombre ?? 'N/A',
-                    $acceso->puerta?->nombre ?? 'N/A',
-                    $acceso->tipo_evento ?? '',
+                    self::csvTextField($acceso->user?->name ?? 'N/A'),
+                    self::csvTextField($acceso->user?->email ?? 'N/A'),
+                    self::csvTextField($acceso->puerta?->piso?->nombre ?? 'N/A'),
+                    self::csvTextField($acceso->puerta?->nombre ?? 'N/A'),
+                    self::csvTextField($acceso->tipo_evento ?? ''),
                     $acceso->permitido ? 'Sí' : 'No',
-                    $acceso->motivo_denegacion ?? '',
-                    $acceso->observaciones ?? '',
+                    self::csvTextField($acceso->motivo_denegacion ?? ''),
+                    self::csvTextField($acceso->observaciones ?? ''),
                 ]);
             }
 
-            fclose($file);
+            fclose($handle);
         }, $filename, [
             'Content-Type' => 'text/csv; charset=UTF-8',
             'Content-Disposition' => 'attachment; filename="' . $filename . '"',
         ]);
+    }
+
+    /**
+     * Filtros compartidos entre la vista paginada y la exportación CSV.
+     *
+     * @param  Builder<Acceso>  $query
+     */
+    private static function applyAccesosReportFilters(Builder $query, array $filtros): void
+    {
+        if (! empty($filtros['fecha_desde'])) {
+            $query->whereDate('fecha_acceso', '>=', $filtros['fecha_desde']);
+        }
+
+        if (! empty($filtros['fecha_hasta'])) {
+            $query->whereDate('fecha_acceso', '<=', $filtros['fecha_hasta']);
+        }
+
+        if (! empty($filtros['gerencia_id'])) {
+            if ($filtros['gerencia_id'] === 'despacho') {
+                $query->whereHas('user', function ($q) {
+                    $q->whereNull('gerencia_id');
+                });
+            } else {
+                $query->whereHas('user', function ($q) use ($filtros) {
+                    $q->where('gerencia_id', $filtros['gerencia_id']);
+                });
+            }
+        } elseif (! empty($filtros['secretaria_id'])) {
+            $query->whereHas('user.gerencia', function ($q) use ($filtros) {
+                $q->where('secretaria_id', $filtros['secretaria_id']);
+            });
+        }
+
+        if (! empty($filtros['piso_id'])) {
+            $query->whereHas('puerta', function ($q) use ($filtros) {
+                $q->where('piso_id', $filtros['piso_id']);
+            });
+        }
+
+        if (! empty($filtros['tipo_evento'])) {
+            $query->where('tipo_evento', $filtros['tipo_evento']);
+        }
+
+        $permitido = self::parsePermitidoQueryValue($filtros['permitido'] ?? null);
+        if ($permitido !== null) {
+            $query->where('permitido', $permitido);
+        }
+    }
+
+    /**
+     * Interpreta permitido desde query string (GET): evita (bool) "false" === true.
+     */
+    private static function parsePermitidoQueryValue(mixed $value): ?bool
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        if (is_bool($value)) {
+            return $value;
+        }
+
+        return filter_var($value, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+    }
+
+    /**
+     * Texto seguro para celdas CSV (saltos de línea; UTF-8 inválido).
+     */
+    private static function csvTextField(mixed $value): string
+    {
+        if ($value === null) {
+            return '';
+        }
+
+        $s = is_string($value) ? $value : (string) $value;
+        $s = str_replace(["\r\n", "\r", "\n"], ' ', $s);
+
+        if ($s !== '' && function_exists('mb_check_encoding') && ! mb_check_encoding($s, 'UTF-8')) {
+            $converted = @mb_convert_encoding($s, 'UTF-8', 'UTF-8');
+
+            return $converted !== false ? $converted : '';
+        }
+
+        return $s;
     }
 
     /**
@@ -723,9 +732,6 @@ class ReportesController extends Controller
         }, $a));
     }
 
-    /**
-     * @param  array<string, mixed>  $datosExtraidos
-     */
     /**
      * Formatea fecha_acceso para la tabla del reporte (evita 500 si hay fechas corruptas o inválidas en BD).
      */
